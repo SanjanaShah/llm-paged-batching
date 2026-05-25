@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+include = ["src", "tests", "benchmarks"]
