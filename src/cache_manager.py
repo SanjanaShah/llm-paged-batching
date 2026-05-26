@@ -65,21 +65,30 @@ class CacheManager:
         needed = request.num_logical_blocks_needed()
         if self._gpu.num_free_blocks() < needed:
             return False
-        self._gpu_table[request.request_id] = [self._gpu.allocate() for _ in range(needed)]
+        
+        gpu_blocks = []
+        for _ in range(needed):
+            block = self._gpu.allocate()
+            if block is None: # allocation fails
+                return False
+            gpu_blocks.append(block)
+        self._gpu_table[request.request_id] = gpu_blocks
         return True
 
     def append_slot(self, request: SequenceRequest) -> bool:
         """
         Lazily grows a sequence's block table by one physical block only when
-        a new logical block boundary is crossed (every BLOCK_SIZE tokens).
-        Called once per decode step per active sequence.
-        Returns False if GPU is OOM — caller must preempt this sequence.
+        a new block boundary is crossed. Called once per decode step per active sequence.
+        Returns False if GPU is OOM - caller must preempt this sequence (paused till
+        active memory).
         """
         needed = request.num_logical_blocks_needed()
         current = self._gpu_table.get(request.request_id, [])
+
+        # if we need to allocate 1 more block
         if needed > len(current):
             block = self._gpu.allocate()
-            if block is None:
+            if block is None: # allocation fails
                 return False
             current.append(block)
             self._gpu_table[request.request_id] = current
@@ -92,7 +101,7 @@ class CacheManager:
     def swap_out(self, request: SequenceRequest) -> bool:
         """
         Evict a sequence from GPU to CPU (swap-out preemption).
-        GPU blocks are freed immediately; CPU blocks hold the logical mapping.
+        GPU blocks are freed immediately and moved to CPU.
         Returns False if CPU is also full — caller falls back to recompute.
         """
         gpu_blocks = self._gpu_table.pop(request.request_id, [])
@@ -100,9 +109,21 @@ class CacheManager:
             return False
         if self._cpu.num_free_blocks() < len(gpu_blocks):
             for b in gpu_blocks:
+                # kill the req, there are no free blocks in GPU and CPU to handle this req
                 self._gpu.free(b)
             return False
-        self._cpu_table[request.request_id] = [self._cpu.allocate() for _ in gpu_blocks]
+
+        cpu_blocks = []
+        for _ in gpu_blocks:
+            block = self._cpu.allocate()
+            if block is None: # allocation fails
+                for b in cpu_blocks: # clear cpu blocks so far
+                    self._cpu.free(b)
+                return False
+            cpu_blocks.append(block)
+        self._cpu_table[request.request_id] = cpu_blocks
+
+        # free gpu
         for b in gpu_blocks:
             self._gpu.free(b)
         return True
@@ -113,16 +134,29 @@ class CacheManager:
         Returns False if GPU still lacks space — sequence stays on CPU.
         """
         cpu_blocks = self._cpu_table.get(request.request_id, [])
-        if not cpu_blocks:
+        if not cpu_blocks: # if not in cpu
             return False
-        if self._gpu.num_free_blocks() < len(cpu_blocks):
+        if self._gpu.num_free_blocks() < len(cpu_blocks): # no space in gpu
             return False
-        self._gpu_table[request.request_id] = [self._gpu.allocate() for _ in cpu_blocks]
+
+        new_gpu_blocks = []
+        for _ in cpu_blocks:
+            block = self._gpu.allocate()
+            if block is None: # allocation in gpu fails
+                for b in new_gpu_blocks: # clear gpu blocks so far
+                    self._gpu.free(b)
+                return False
+            new_gpu_blocks.append(block)
+        self._gpu_table[request.request_id] = new_gpu_blocks
+
         for b in cpu_blocks:
             self._cpu.free(b)
         del self._cpu_table[request.request_id]
         return True
 
+    # Example Output:
+    # >>> cache_manager.block_table_for("req-042")
+    # [4, 82, 19]
     def block_table_for(self, request_id: str) -> List[int]:
         return [b.block_id for b in self._gpu_table.get(request_id, [])]
 
