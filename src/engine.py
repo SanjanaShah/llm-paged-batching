@@ -11,11 +11,10 @@ from src.scheduler import AetherserveScheduler, SchedulerOutputs
 # Simulated forward-pass latency constants.
 # Prefill is compute-bound: cost grows with number of input tokens (quadratic attention).
 # Decode is memory-bandwidth-bound: cost is nearly flat per step regardless of batch size,
-# because we're streaming KV-cache reads from HBM rather than recomputing attention.
+# because we're streaming KV-cache reads, not recomputing attention.
 _PREFILL_COST_PER_TOKEN_S = 0.003   # 3 ms / prompt token
-_DECODE_STEP_LATENCY_S = 0.020      # 20 ms / decode iteration (flat, bandwidth-bound)
+_DECODE_STEP_LATENCY_S = 0.020      # 20 ms / decode iteration
 _DECODE_JITTER_S = 0.002            # ±2 ms stochastic kernel overhead
-
 
 class AetherEngine:
     """
@@ -31,12 +30,8 @@ class AetherEngine:
     without touching scheduler or cache logic.
     """
 
-    def __init__(
-        self,
-        num_gpu_blocks: int = 128,
-        num_cpu_blocks: int = 256,
-        max_batch_size: int = 8,
-    ) -> None:
+    def __init__(self, num_gpu_blocks: int = 128, num_cpu_blocks: int = 256,
+                 max_batch_size: int = 8) -> None:
         self.cache_manager = CacheManager(
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
@@ -47,6 +42,8 @@ class AetherEngine:
         )
         self.metrics = MetricsTracker()
         self._step_count: int = 0
+
+        # list of funcs, run whenever a token is generated
         self._token_callbacks: List[Callable[[str, int], None]] = []
 
     def add_request(self, request: SequenceRequest) -> None:
@@ -56,11 +53,17 @@ class AetherEngine:
             max_output_tokens=request.max_output_tokens,
             arrival_time=request.arrival_time,
         )
-        self.scheduler.add_request(request)
+        self.scheduler.add_request(request) # req added to waiting queue
+        # on next step, we take running, then swapped, then new req in waiting
 
     def register_token_callback(self, cb: Callable[[str, int], None]) -> None:
-        """Register a function called on every generated token (request_id, token_id)."""
+        # external code can suscribe to generated tokens
         self._token_callbacks.append(cb)
+
+        # i.e. def print_token(req_id, token):
+        #.         print(req_id, token)
+        # engine.register_token_callback(print_token)
+        #   -> whenever token generated, print_token gets called
 
     async def step(self) -> Optional[SchedulerOutputs]:
         """
@@ -72,6 +75,8 @@ class AetherEngine:
         flat cost, so batching more sequences together is nearly free.
         """
         outputs = self.scheduler.schedule()
+        # outputs: scheduled, swapped in, swapped out, preempted, num_batched_tokens
+        # run scheduled, pause preempted (swapped - in cpu/waiting - completely wiping math)
 
         for req in outputs.swapped_out:
             self.metrics.on_swap_out()
@@ -82,12 +87,14 @@ class AetherEngine:
             if self.scheduler.has_unfinished_requests():
                 await asyncio.sleep(0.001)
             return outputs
+            # no reqs scheduled THIS iteration, not system has no requests
+            # reqs may be in waiting, or swapped out
 
         self._step_count += 1
         step_start = time.monotonic()
 
-        # Separate newly-admitted (prefill) from continuing (decode) sequences.
-        # Prefill sequences have no generated tokens yet.
+        # separate reqs that need to run this step: prefill from decode, if req has
+        # no generated_tokens = compute heavy prefill, else memory-bound decode
         prefill_seqs = [r for r in outputs.scheduled if not r.generated_tokens]
         decode_seqs = [r for r in outputs.scheduled if r.generated_tokens]
 
