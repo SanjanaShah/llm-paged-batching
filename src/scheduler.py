@@ -1,30 +1,59 @@
-from dataclasses import dataclass, field
-from typing import List
-from src.models import SequenceRequest, SequenceStatus
-from src.cache_manager import CacheManager
+"""
+Hierarchical Adaptive Scheduler for AetherServe.
+
+Implements iteration-level continuous batching with a three-tier cascading
+eviction policy:
+
+  Tier 1 (GPU) OOM  → try swap_gpu_to_cpu
+  Tier 2 (CPU) also full → find coldest CPU-swapped request by last_accessed_time,
+                           cascade it to Tier 3 storage, then retry GPU→CPU
+  Both full             → recompute (drop blocks, re-queue as WAITING)
+
+The elevator logic runs every step in reverse:
+  Tier 3 → Tier 2 when CPU has room (passive restore)
+  Tier 2 → Tier 1 when GPU batch is not full (admit to running)
+
+Predictive prefetch hook: the PredictivePrefetcher calls tick() once per
+engine step to proactively move soon-needed storage blocks up to CPU before
+the scheduler formally requests them, hiding Tier 3 I/O latency.
+
+Scheduling priority within queues: FCFS (arrival order).
+"""
+
+import time
 from collections import deque
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+from src.cache_manager import HierarchicalCacheManager
+from src.models import SequenceRequest, SequenceStatus
 
 
 @dataclass
 class SchedulerOutputs:
     """
-    Describes the exact set of sequences to run in the next engine step.
+    Snapshot of what happened during one schedule() call.
 
-    scheduled: sequences that will participate in this forward pass iteration
-    preempted: sequences evicted this step (either finished or OOM)
-    swapped_in: sequences restored from CPU to GPU this step
-    swapped_out: sequences evicted from GPU to CPU this step
-    num_batched_tokens: total tokens sent through the model (prefill + 1 per decode)
+    scheduled       — sequences that will execute in this engine step
+    preempted       — sequences evicted from GPU (finished OR OOM)
+    swapped_cpu_out — sequences moved Tier 1 → Tier 2 this step
+    swapped_cpu_in  — sequences restored Tier 2 → Tier 1 this step
+    swapped_storage_out — sequences moved Tier 2 → Tier 3 this step
+    swapped_storage_in  — sequences restored Tier 3 → Tier 2 this step
+    num_batched_tokens  — total token budget consumed this step
+                          (BLOCK_SIZE * num_prefill_tokens + 1 per decode)
 
-    num_batched_tokens math:
-    User 1 (new): prompt 40 tokens, User 2 (new): prompt 10 tokens
-    User 3 (running): history 500 tokens + generating, User 4 (running): history 12 tokens + generating
-    num_batched_tokens = 40+10+1+1 = 52 tokens
+    num_batched_tokens example:
+      User A (new, 40-token prompt) + User B (new, 10-token prompt)
+      + User C (running, generating) + User D (running, generating)
+      → num_batched_tokens = 40 + 10 + 1 + 1 = 52
     """
     scheduled: List[SequenceRequest] = field(default_factory=list)
     preempted: List[SequenceRequest] = field(default_factory=list)
-    swapped_in: List[SequenceRequest] = field(default_factory=list)
-    swapped_out: List[SequenceRequest] = field(default_factory=list)
+    swapped_cpu_out: List[SequenceRequest] = field(default_factory=list)
+    swapped_cpu_in: List[SequenceRequest] = field(default_factory=list)
+    swapped_storage_out: List[SequenceRequest] = field(default_factory=list)
+    swapped_storage_in: List[SequenceRequest] = field(default_factory=list)
     num_batched_tokens: int = 0
 
     @property
@@ -32,104 +61,98 @@ class SchedulerOutputs:
         return not self.scheduled
 
 
-class AetherserveScheduler:
+class HierarchicalAdaptiveScheduler:
     """
-    Continuous batching scheduler.
+    Three-tier continuous batching scheduler.
 
-    Each scheduling step dynamically decides which requests run,
-    wait, swap to CPU memory, or finish. This allows the engine
-    to efficiently share GPU memory across many concurrent users.
+    Queues:
+      waiting_queue         — requests not yet allocated any GPU memory
+      running_queue         — requests actively executing on GPU
+      swapped_cpu_queue     — requests with blocks in CPU DRAM (Tier 2)
+      swapped_storage_queue — requests with blocks in NVMe storage (Tier 3)
     """
 
-    def __init__(self, cache_manager: CacheManager, max_batch_size: int = 8):
+    def __init__(
+        self,
+        cache_manager: HierarchicalCacheManager,
+        max_batch_size: int = 8,
+    ) -> None:
         self.cache_manager = cache_manager
         self.max_batch_size = max_batch_size
-        
-        # deques for efficient front/back modifications
-        self.waiting_queue: deque[SequenceRequest] = deque()
-        self.swapped_queue: deque[SequenceRequest] = deque()
 
+        self.waiting_queue: deque[SequenceRequest] = deque()
         self.running_queue: List[SequenceRequest] = []
+        self.swapped_cpu_queue: deque[SequenceRequest] = deque()
+        self.swapped_storage_queue: deque[SequenceRequest] = deque()
 
     def add_request(self, request: SequenceRequest) -> None:
         request.status = SequenceStatus.WAITING
-        self.waiting_queue.append(request) # req comes in, append to waiting
-        # req contains id, prompt tokens, max out tokens, tokens generated
-        #     status (default waiting), time metrics
+        self.waiting_queue.append(request)
 
     def schedule(self) -> SchedulerOutputs:
-        outputs = SchedulerOutputs() # create scheduler output for results of iteration
+        outputs = SchedulerOutputs()
 
-        # << Address currently RUNNING tasks >>
-        still_running: List[SequenceRequest] = [] # if not done
+        # Phase 1: Extend running sequences
+        # For each running request, try to secure a GPU slot for the next
+        # token. If the GPU is full, cascade the request down a tier.
+        still_running: List[SequenceRequest] = []
+
         for req in self.running_queue:
+            req.last_accessed_time = time.monotonic()
+
             if req.is_finished:
                 req.status = SequenceStatus.FINISHED
-                self.cache_manager.free(req.request_id) # free if finished
-                outputs.preempted.append(req) # add to done
+                self.cache_manager.free(req.request_id)
+                outputs.preempted.append(req)
                 continue
 
-            # req is not finished
-            if self.cache_manager.append_slot(req): # check if another slot is needed/get, proceed
+            if self.cache_manager.append_slot(req):
+                # Slot secured — this request runs in this step
                 still_running.append(req)
                 outputs.scheduled.append(req)
                 outputs.num_batched_tokens += 1
-            else: # can't give another slot, OOM: try swap-out to CPU, fall back to WAITING
-                if self.cache_manager.swap_out(req): # if swap to CPU, good
-                    req.status = SequenceStatus.SWAPPED
-                    self.swapped_queue.appendleft(req) # appendleft to handle it sooner
-                    outputs.swapped_out.append(req)
-                else:
-                    # Treat as a new request for recomputation
-                    # CPU - raw text of prompt + partial response is not wiped
-                    # GPU - wipe all dynamically allocated blocks holding context math (prompt + response)
-                    req.status = SequenceStatus.WAITING
-                    self.cache_manager.free(req.request_id)
-                    self.waiting_queue.appendleft(req)
-                outputs.preempted.append(req)
+            else:
+                # GPU OOM: begin cascading eviction
+                self._cascade_evict(req, outputs)
 
-        self.running_queue = still_running # set for next iteration
+        self.running_queue = still_running
 
-        # << Bring back swapped tasks (these were paused, but mem is in CPU) >>
-        still_swapped: deque[SequenceRequest] = deque() # these will remain swapped
-        
-        while self.swapped_queue:
-            # Check the batch limit
-            # If the GPU batch is already full, we can stop evaluating immediately
+        # Phase 2: Restore elevator (Tier 3 → Tier 2 → Tier 1)
+        # Tier 3 → Tier 2: restore storage-swapped requests to CPU if room
+        still_storage: deque[SequenceRequest] = deque()
+        while self.swapped_storage_queue:
+            req = self.swapped_storage_queue.popleft()
+            if self.cache_manager.swap_storage_to_cpu(req):
+                req.status = SequenceStatus.SWAPPED_CPU
+                self.swapped_cpu_queue.appendleft(req)
+                outputs.swapped_storage_in.append(req)
+            else:
+                still_storage.append(req)
+        self.swapped_storage_queue = still_storage
+
+        # Tier 2 → Tier 1: admit CPU-swapped requests to GPU if batch has room
+        still_cpu: deque[SequenceRequest] = deque()
+        while self.swapped_cpu_queue:
             if len(self.running_queue) >= self.max_batch_size:
-                break 
-
-            req = self.swapped_queue.popleft()
-                
-            if self.cache_manager.swap_in(req):
+                still_cpu.extend(self.swapped_cpu_queue)
+                break
+            req = self.swapped_cpu_queue.popleft()
+            if self.cache_manager.swap_cpu_to_gpu(req):
                 req.status = SequenceStatus.RUNNING
                 self.running_queue.append(req)
-                outputs.swapped_in.append(req)
+                outputs.swapped_cpu_in.append(req)
                 outputs.scheduled.append(req)
                 outputs.num_batched_tokens += 1
             else:
-                still_swapped.append(req)  # Put back, GPU lacks mem
-                
-        # If we broke early because the batch was full, add any 
-        # un-evaluated requests back
-        if still_swapped:
-            self.swapped_queue.extendleft(reversed(still_swapped))
+                still_cpu.append(req)
+        if still_cpu:
+            self.swapped_cpu_queue.extendleft(reversed(list(still_cpu)))
 
-        # ex. scenario: req A (large), req B (small), req C (medium)
-        # gpu doesnt have mem for req A -> still_swapped
-        # req B swapped in -> running_queue, batch at max cap, STOP!
-        # reverse: req A, X, Z in still_swapped, reverse to Z, X, A, push to front: A, X, Z, ...
-        # swapped_queue looks like: A, C
-        self.swapped_queue.extendleft(reversed(still_swapped)) if still_swapped else None
-
-        # << Pre-fill (new reqs in waiting_queue) >>
-        while self.waiting_queue and len(self.running_queue) < self.max_batch_size: # have req space we can process
-            candidate = self.waiting_queue[0] # peek
+        # Phase 3: Admit new requests (prefill)
+        while self.waiting_queue and len(self.running_queue) < self.max_batch_size:
+            candidate = self.waiting_queue[0]
             if not self.cache_manager.can_allocate(candidate):
-                break
-            # we do not loop through rest, because otherwise front user will be put on hold forever
-            # fifo - first in has priority
-
+                break  # can't allocate, hold the line (FIFO, no starvation)
             if self.cache_manager.allocate(candidate):
                 candidate.status = SequenceStatus.RUNNING
                 self.waiting_queue.popleft()
@@ -141,14 +164,69 @@ class AetherserveScheduler:
 
         return outputs
 
-    # returns true if there is a req in waiting or decoding or paused
-    # we can shut down if there are no active reqs
+    def _cascade_evict(
+        self, req: SequenceRequest, outputs: SchedulerOutputs
+    ) -> None:
+        """
+        GPU OOM eviction cascade for a single sequence.
+
+        Step 1: try GPU → CPU.
+        Step 2: if CPU full, find the coldest CPU-swapped request
+                (min last_accessed_time) and push it to Tier 3 storage
+                to free a CPU slot, then retry GPU → CPU.
+        Step 3: if storage is also full, drop the request entirely and
+                re-queue for full recomputation.
+        """
+        if self.cache_manager.swap_gpu_to_cpu(req):
+            req.status = SequenceStatus.SWAPPED_CPU
+            self.swapped_cpu_queue.appendleft(req)
+            outputs.swapped_cpu_out.append(req)
+            outputs.preempted.append(req)
+            return
+
+        # CPU also full — cascade the coldest CPU resident to Tier 3
+        cold = self._coldest_cpu_request()
+        if cold is not None and self.cache_manager.swap_cpu_to_storage(cold):
+            cold.status = SequenceStatus.SWAPPED_STORAGE
+            try:
+                self.swapped_cpu_queue.remove(cold)
+            except ValueError:
+                pass
+            self.swapped_storage_queue.append(cold)
+            outputs.swapped_storage_out.append(cold)
+
+            # Retry now that a CPU slot opened up
+            if self.cache_manager.swap_gpu_to_cpu(req):
+                req.status = SequenceStatus.SWAPPED_CPU
+                self.swapped_cpu_queue.appendleft(req)
+                outputs.swapped_cpu_out.append(req)
+                outputs.preempted.append(req)
+                return
+
+        # All tiers exhausted — recompute (wipe blocks, re-queue as WAITING)
+        req.status = SequenceStatus.WAITING
+        self.cache_manager.free(req.request_id)
+        self.waiting_queue.appendleft(req)
+        outputs.preempted.append(req)
+
+    def _coldest_cpu_request(self) -> Optional[SequenceRequest]:
+        """Return the CPU-swapped request with the oldest last_accessed_time."""
+        if not self.swapped_cpu_queue:
+            return None
+        return min(self.swapped_cpu_queue, key=lambda r: r.last_accessed_time)
+
     def has_unfinished_requests(self) -> bool:
-        return bool(self.waiting_queue or self.running_queue or self.swapped_queue)
+        return bool(
+            self.waiting_queue
+            or self.running_queue
+            or self.swapped_cpu_queue
+            or self.swapped_storage_queue
+        )
 
     def stats(self) -> dict:
         return {
             "waiting": len(self.waiting_queue),
             "running": len(self.running_queue),
-            "swapped": len(self.swapped_queue),
+            "swapped_cpu": len(self.swapped_cpu_queue),
+            "swapped_storage": len(self.swapped_storage_queue),
         }

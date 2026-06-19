@@ -1,7 +1,7 @@
 import pytest
 from src.models import SequenceRequest, SequenceStatus, BLOCK_SIZE
-from src.cache_manager import CacheManager
-from src.scheduler import AetherserveScheduler
+from src.cache_manager import HierarchicalCacheManager
+from src.scheduler import HierarchicalAdaptiveScheduler
 
 
 def _req(rid: str, prompt_len: int = BLOCK_SIZE, max_output: int = 4) -> SequenceRequest:
@@ -12,9 +12,9 @@ def _req(rid: str, prompt_len: int = BLOCK_SIZE, max_output: int = 4) -> Sequenc
     )
 
 
-def _make_scheduler(gpu_blocks: int = 64, cpu_blocks: int = 64, batch: int = 4) -> AetherserveScheduler:
-    return AetherserveScheduler(
-        cache_manager=CacheManager(num_gpu_blocks=gpu_blocks, num_cpu_blocks=cpu_blocks),
+def _make_scheduler(gpu_blocks: int = 64, cpu_blocks: int = 64, batch: int = 4) -> HierarchicalAdaptiveScheduler:
+    return HierarchicalAdaptiveScheduler(
+        cache_manager=HierarchicalCacheManager(num_gpu_blocks=gpu_blocks, num_cpu_blocks=cpu_blocks),
         max_batch_size=batch,
     )
 
@@ -85,8 +85,8 @@ def test_continuous_injection_after_finish():
 
 def test_preemption_on_oom():
     """When GPU is full and a running sequence needs a new block, it must be preempted."""
-    cache = CacheManager(num_gpu_blocks=2, num_cpu_blocks=16)
-    sched = AetherserveScheduler(cache_manager=cache, max_batch_size=8)
+    cache = HierarchicalCacheManager(num_gpu_blocks=2, num_cpu_blocks=16)
+    sched = HierarchicalAdaptiveScheduler(cache_manager=cache, max_batch_size=8)
 
     r1 = _req("r1", prompt_len=BLOCK_SIZE, max_output=BLOCK_SIZE + 2)
     r2 = _req("r2", prompt_len=BLOCK_SIZE, max_output=BLOCK_SIZE + 2)
@@ -104,8 +104,8 @@ def test_preemption_on_oom():
 
     # Next schedule: 0 free GPU blocks, both need growth → at least one preempted
     out = sched.schedule()
-    total_preempted_or_swapped = len(out.swapped_out) + sum(
-        1 for r in out.preempted if r.status in (SequenceStatus.WAITING, SequenceStatus.SWAPPED)
+    total_preempted_or_swapped = len(out.swapped_cpu_out) + sum(
+        1 for r in out.preempted if r.status in (SequenceStatus.WAITING, SequenceStatus.SWAPPED_CPU)
     )
     assert total_preempted_or_swapped >= 1
 
@@ -133,7 +133,7 @@ def test_swap_in_after_gpu_pressure_drops():
     out = sched.schedule()
 
     # If r1 was swapped, next schedule with freed r2 blocks should swap it back in
-    if r1.status == SequenceStatus.SWAPPED:
+    if r1.status == SequenceStatus.SWAPPED_CPU:
         out2 = sched.schedule()
         assert r1.status == SequenceStatus.RUNNING
 

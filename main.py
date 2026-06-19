@@ -1,180 +1,246 @@
 #!/usr/bin/env python3
 """
-AetherServe Enterprise Production Driver.
+AetherServe Production Driver.
 
-This module sets up an asynchronous execution environment for continuous batching 
-and virtual KV-cache scheduling, simulating high-throughput LLM serving infrastructure.
+Runs 4 concurrent requests through the 3-tier engine with a live telemetry
+dashboard showing block counts moving across GPU / CPU / NVMe storage in
+real time.
+
+Model selection (at startup):
+  - If `transformers` and `torch` are installed, loads Qwen/Qwen2.5-0.5B-Instruct
+    and generates real text.
+  - Falls back to MockBackend automatically (no download needed), which
+    produces synthetic token IDs useful for benchmarking tier mechanics.
+
+Memory is intentionally constrained to force evictions across all three tiers
+under the 4-request load. Watch the TIER row in the dashboard change.
 """
 
 import asyncio
 import logging
 import sys
 import time
-from typing import Dict, List
+from typing import Dict, Tuple
 
+from src.backends import MockBackend, ModelBackend
 from src.engine import AetherEngine
-from src.models import SequenceRequest, SequenceStatus
+from src.models import SequenceRequest
 
-# --- PRODUCTION LOGGING ARCHITECTURE ---
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(name)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("AetherServe")
 
 
-# --- REAL-TIME ASYNC STREAM HANDLER ---
+# ── Token stream router ───────────────────────────────────────────────────────
+
 class TokenStreamRouter:
-    """Manages thread-safe asynchronous token delivery streams for concurrent users."""
+    """
+    Routes generated tokens to per-request async queues.
+
+    Each client coroutine consumes from its own queue via consume_stream(),
+    which yields (token_id, token_text) tuples as they arrive. A None
+    sentinel signals end-of-stream.
+
+    asyncio.Queue is safe here because everything runs on one event loop
+    and call_soon_threadsafe serializes puts from any thread context.
+    """
+
     def __init__(self) -> None:
         self._streams: Dict[str, asyncio.Queue] = {}
 
-    def register_request(self, request_id: str) -> None:
-        """Initialize an isolated data stream queue for a unique request ID."""
+    def register(self, request_id: str) -> None:
         self._streams[request_id] = asyncio.Queue()
 
-    def push_token(self, request_id: str, token_id: int) -> None:
-        """Callback engine hook to intercept generated tokens and route them to queues."""
+    def push_token(self, request_id: str, token_id: int, token_text: str) -> None:
         if request_id in self._streams:
-            # Safe, thread-friendly background push
             loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(self._streams[request_id].put_nowait, token_id)
+            loop.call_soon_threadsafe(
+                self._streams[request_id].put_nowait, (token_id, token_text)
+            )
 
     async def consume_stream(self, request_id: str):
-        """Asynchronous generator yielding tokens sequentially as they are produced."""
         queue = self._streams.get(request_id)
         if not queue:
             return
-
         while True:
-            token = await queue.get()
-            if token is None:  # Sentinel value signaling end-of-stream
+            item = await queue.get()
+            if item is None:
                 queue.task_done()
                 break
-            yield token
+            yield item
             queue.task_done()
 
-    def close_stream(self, request_id: str) -> None:
-        """Inject an explicit termination signal into the designated user queue."""
+    def close(self, request_id: str) -> None:
         if request_id in self._streams:
             loop = asyncio.get_event_loop()
             loop.call_soon_threadsafe(self._streams[request_id].put_nowait, None)
 
 
-# --- CONCURRENT CLIENT SIMULATORS ---
-async def simulate_user_client(request_id: str, router: TokenStreamRouter):
-    """Simulates an external client consuming a live, real-time token stream from the server."""
-    logger.info(f"📡 Client [{request_id}] initialized streaming connection channel.")
-    
-    tokens_received = 0
-    start_time = time.monotonic()
-    ttft_recorded = False
+# ── Per-client consumer ───────────────────────────────────────────────────────
 
-    async for token in router.consume_stream(request_id):
-        if not ttft_recorded:
-            ttft_ms = (time.monotonic() - start_time) * 1000
-            logger.info(f"✨ Client [{request_id}] -> Time-To-First-Token (TTFT): {ttft_ms:.1f}ms")
-            ttft_recorded = True
-            
-        tokens_received += 1
-        # In a real microservice, this streams raw data chunks to WebSockets / HTTP
-        print(f"\033[34m[STREAM-{request_id}]\033[0m Generated Token ID: {token}")
+async def client_consumer(request_id: str, router: TokenStreamRouter) -> None:
+    """
+    Simulates a downstream client (e.g. WebSocket connection) consuming
+    the token stream for one request. Prints each token as it arrives and
+    records TTFT on first token.
+    """
+    start = time.monotonic()
+    first = True
+    count = 0
+    text_buf = []
 
-    duration = time.monotonic() - start_time
-    tps = tokens_received / max(0.001, duration)
-    logger.info(f"🛑 Client [{request_id}] Stream Finished. Tokens: {tokens_received}, Speed: {tps:.1f} TPS")
+    async for _, token_text in router.consume_stream(request_id):
+        if first:
+            ttft_ms = (time.monotonic() - start) * 1000
+            logger.info(f"[{request_id}] TTFT {ttft_ms:.0f}ms")
+            first = False
+        text_buf.append(token_text)
+        count += 1
+
+    duration = time.monotonic() - start
+    tps = count / max(duration, 0.001)
+    output = "".join(text_buf)
+    logger.info(f"[{request_id}] Done — {count} tokens, {tps:.1f} tok/s")
+    if output.strip():
+        print(f"\n  [{request_id}] → {output[:120]}")
 
 
-# --- MAIN ORCHESTRATION EVENT LOOP ---
-async def main():
-    logger.info("=== Starting AetherServe High-Performance Inference Engine ===")
+# ── Live telemetry dashboard ──────────────────────────────────────────────────
 
-    # 1. Initialize core system dependencies using bounded memory pressures
-    # We restrict blocks to show preemption handling under load
+async def telemetry_loop(engine: AetherEngine, interval_s: float = 0.05) -> None:
+    """
+    Prints a single updating line showing tier utilization every `interval_s`.
+    Uses \\r to overwrite the same terminal line so it looks like a live gauge.
+
+    TIER  GPU:used/total | CPU:used/total | NVMe:used/total
+    QUEUE waiting | running | cpu-swapped | storage-swapped
+    """
+    while engine.scheduler.has_unfinished_requests():
+        m = engine.memory_stats()
+        s = engine.scheduler_stats()
+        xfers = engine.metrics._tier_transfers
+        xfer_str = "  ".join(f"{f}→{t}:{c}" for (f, t), c in xfers.items()) or "none"
+        line = (
+            f"\r\033[33m[TIER]\033[0m "
+            f"GPU {m['gpu_used_blocks']:>2}/{m['gpu_total_blocks']} "
+            f"| CPU {m['cpu_used_blocks']:>2}/{m['cpu_total_blocks']} "
+            f"| NVMe {m['storage_used_blocks']:>2}/{m['storage_total_blocks']} "
+            f"  \033[36m[Q]\033[0m "
+            f"W:{s['waiting']} R:{s['running']} "
+            f"SC:{s['swapped_cpu']} SS:{s['swapped_storage']}"
+            f"  \033[35m[XFER]\033[0m {xfer_str}"
+            "          "  # trailing spaces to clear previous longer lines
+        )
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        await asyncio.sleep(interval_s)
+    sys.stdout.write("\r" + " " * 120 + "\r")  # clear the line
+    sys.stdout.flush()
+
+
+# ── Model loader ──────────────────────────────────────────────────────────────
+
+def load_backend() -> Tuple[ModelBackend, str]:
+    try:
+        from src.backends import TransformersBackend
+        model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+        logger.info(f"Loading {model_id} — this may take a moment on first run...")
+        backend = TransformersBackend(model_id)
+        return backend, model_id
+    except (ImportError, Exception) as e:
+        logger.info(f"TransformersBackend unavailable ({e}), using MockBackend")
+        return MockBackend(), "MockBackend"
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    logger.info("=" * 60)
+    logger.info("  AetherServe  |  3-Tier Hierarchical KV-Cache Engine")
+    logger.info("=" * 60)
+
+    backend, model_name = load_backend()
+    logger.info(f"Backend: {model_name}")
+
+    # Tight block budget forces all three tiers into play under 4-request load
     engine = AetherEngine(
-        num_gpu_blocks=16,      # Forces memory saturation
-        num_cpu_blocks=32,      # Limits backup swap space allocation
-        max_batch_size=4        # Hard ceiling on batch matrix step width
+        backend=backend,
+        num_gpu_blocks=8,
+        num_cpu_blocks=12,
+        num_storage_blocks=64,
+        max_batch_size=3,
     )
-    router = TokenStreamRouter()
 
-    # Bind the router to our engine callback system
+    router = TokenStreamRouter()
     engine.register_token_callback(router.push_token)
 
-    # 2. Design a heterogeneous test batch derived straight from your test conditions
-    now = time.monotonic()
-    raw_prompts = [
-        ("User-Alpha",   20, 15),  # Medium prompt, mid output
-        ("User-Bravo",   6,  10),  # Light prefill, low footprint
-        ("User-Charlie", 64, 30),  # Heavy prompt - deliberately triggers preemption or swap pressure
-        ("User-Delta",   2,  8),   # Fast execution turnaround
+    prompts = [
+        ("Req-Alpha",   "What is PagedAttention and why does it eliminate GPU memory fragmentation?", 40),
+        ("Req-Bravo",   "Write a haiku about NVMe storage latency.", 20),
+        ("Req-Charlie", "Explain continuous batching in three sentences.", 35),
+        ("Req-Delta",   "What is the difference between prefill and decode phases in LLM inference?", 45),
     ]
 
-    requests: List[SequenceRequest] = []
     client_tasks = []
-
-    # 3. Provision queues and register monitoring handles
-    for rid, prompt_len, max_out in raw_prompts:
+    for rid, text, max_out in prompts:
+        router.register(rid)
         req = SequenceRequest(
             request_id=rid,
-            prompt_tokens=list(range(prompt_len)),
+            prompt_tokens=[],
+            prompt_text=text,
             max_output_tokens=max_out,
-            arrival_time=now
         )
-        requests.append(req)
-        
-        # Open routing queues before starting processing
-        router.register_request(rid)
-        
-        # Launch independent client consumers on the async event loop
-        client_tasks.append(asyncio.create_task(simulate_user_client(rid, router)))
-
-    # 4. Inject inputs into the scheduling core
-    for req in requests:
         engine.add_request(req)
-        logger.info(f"📥 Queued Request [{req.request_id}] | Prompt: {len(req.prompt_tokens)} tokens")
+        client_tasks.append(asyncio.create_task(client_consumer(rid, router)))
+        logger.info(f"Queued [{rid}] prompt_len={len(engine.backend.tokenize(text))} max_out={max_out}")
 
-    # 5. Execute the execution loop concurrently alongside our streaming clients
-    logger.info("🎬 Launching continuous batching loop processing steps...")
-    engine_start_time = time.monotonic()
+    logger.info("\nRunning engine + telemetry in parallel...")
+    start = time.monotonic()
 
-    # Wrap request completion checks with tracking loops
-    while engine.scheduler.has_unfinished_requests():
-        # Step through scheduling, hardware simulation delay, and sampling loops
-        outputs = await engine.step()
-        
-        if outputs:
-            # Close queues for requests that finished during this specific step
-            for req in outputs.scheduled:
-                if req.status == SequenceStatus.FINISHED:
-                    router.close_stream(req.request_id)
+    engine_task = asyncio.create_task(engine.run_until_complete())
 
-    # Reclaim dangling stream references
-    for req in requests:
-        router.close_stream(req.request_id)
+    await asyncio.gather(engine_task, telemetry_loop(engine))
 
-    # Wait for consumer clients to flush their final tokens
+    # Close any streams that didn't get a FINISHED signal in the step loop
+    for rid, _, _ in prompts:
+        router.close(rid)
+
     await asyncio.gather(*client_tasks)
 
-    # 6. Collate System Metrics Output
-    engine_duration = time.monotonic() - engine_start_time
-    summary_stats = engine.metrics.summary()
+    elapsed = time.monotonic() - start
+    summary = engine.metrics.summary()
 
-    print("\n" + "="*50)
-    print("       AETHERSERVE LIVE METRICS SUMMARY REPORT     ")
-    print("="*50)
-    print(f" Total Wall-Clock Operational Execution Time : {engine_duration:.3f} seconds")
-    print(f" Total Completed Client Processing Requests  : {summary_stats.get('total_requests_finished', 0)}")
-    print(f" Total System Text Tokens Fully Generated    : {summary_stats.get('total_tokens_generated', 0)}")
-    print(f" Aggregated Engine Processing Performance    : {summary_stats.get('system_tps', 0.0):.2f} tokens/sec")
-    print(f" Median Expected Response Latency (TTFT P50) : {summary_stats.get('ttft_p50_ms', 0.0):.2f} ms")
-    print("="*50 + "\n")
+    print("\n" + "=" * 60)
+    print("  METRICS SUMMARY")
+    print("=" * 60)
+    print(f"  Wall time          : {elapsed:.3f}s")
+    print(f"  Requests finished  : {summary['total_requests_finished']}")
+    print(f"  Tokens generated   : {summary['total_tokens_generated']}")
+    print(f"  System throughput  : {summary['system_tps']} tok/s")
+    print(f"  TTFT p50 / p90     : {summary['ttft_p50_ms']}ms / {summary['ttft_p90_ms']}ms")
+    print(f"  Latency mean / p99 : {summary['latency_mean_ms']}ms / {summary['latency_p99_ms']}ms")
+    print(f"  Avg batch size     : {summary['avg_batch_size']}")
+    print(f"  Steps              : {summary['total_steps']}")
+    print(f"  Preemptions        : {summary['preemptions']}")
+    print(f"  Tier transfers     : {summary['tier_transfers']}")
+    print(f"  Prefetches (pred.) : {engine.prefetcher.total_prefetches}")
+
+    mem = engine.memory_stats()
+    if mem["storage_quantized"]:
+        saved_kb = mem["storage_bytes_saved"] / 1024
+        ratio = mem["storage_compression_ratio"]
+        print(f"  NVMe compression   : {ratio:.1f}× INT8 | {saved_kb:.1f} KB saved")
+    print("=" * 60)
+
+    engine.cleanup()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.warning("Engine shutdown initialized manually by operator interrupt.")
+        logger.warning("Interrupted.")
         sys.exit(130)

@@ -71,7 +71,7 @@ async def test_token_callback_fires():
     engine = AetherEngine(num_gpu_blocks=64, num_cpu_blocks=128, max_batch_size=4)
     seen_tokens: dict = {}
 
-    def on_token(rid: str, tok: int) -> None:
+    def on_token(rid: str, tok: int, text: str) -> None:
         seen_tokens.setdefault(rid, []).append(tok)
 
     engine.register_token_callback(on_token)

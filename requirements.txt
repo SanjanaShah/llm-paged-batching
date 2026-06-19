@@ -4,3 +4,7 @@ pydantic>=2.5.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
 httpx>=0.26.0
+transformers>=4.40.0
+torch>=2.2.0
+accelerate>=0.27.0
+triton>=2.3.0; sys_platform == "linux"  # CUDA required; falls back to PyTorch on macOS/CPU

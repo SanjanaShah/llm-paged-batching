@@ -14,8 +14,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from src.engine import AetherEngine
-from src.models import SequenceRequest, SequenceStatus
+from engine import AetherEngine
+from models import SequenceRequest, SequenceStatus
 
 app = FastAPI(
     title="AetherServe",
@@ -45,8 +45,8 @@ class GenerateRequest(BaseModel):
 class GenerateResponse(BaseModel):
     request_id: str
     tokens_generated: int
-    ttft_ms: Optional[float]
-    total_latency_ms: Optional[float]
+    ttft_ms: Optional[float] = None
+    total_latency_ms: Optional[float] = None
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -70,22 +70,34 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
         while not sequence.is_finished:
             await engine.step()
 
+    # Extract metrics to local variables first to satisfy static type checkers
+    raw_ttft = sequence.ttft()
+    raw_latency = sequence.total_latency()
+
+    # Calculate values safely after checking that they are not None
+    final_ttft = round(raw_ttft * 1000, 2) if raw_ttft is not None else None
+    final_latency = round(raw_latency * 1000, 2) if raw_latency is not None else None
+
     return GenerateResponse(
         request_id=rid,
         tokens_generated=len(sequence.generated_tokens),
-        ttft_ms=round(sequence.ttft() * 1000, 2) if sequence.ttft() else None,
-        total_latency_ms=round(sequence.total_latency() * 1000, 2) if sequence.total_latency() else None,
+        ttft_ms=final_ttft,
+        total_latency_ms=final_latency,
     )
 
 
 @app.get("/metrics")
 async def metrics() -> JSONResponse:
-    return JSONResponse(_engine.metrics.summary())
+    if _engine is None:
+        return JSONResponse(content={"status": "initializing"}, status_code=503)
+    return JSONResponse(content=_engine.metrics.summary())
 
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    return JSONResponse({
+    if _engine is None:
+        return JSONResponse(content={"status": "initializing"}, status_code=503)
+    return JSONResponse(content={
         "status": "ok",
         "scheduler": _engine.scheduler_stats(),
         "memory": _engine.memory_stats(),
