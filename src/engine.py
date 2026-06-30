@@ -128,7 +128,7 @@ class AetherEngine:
         decode_seqs = [r for r in outputs.scheduled if r.generated_tokens]
 
         if using_mock:
-            # Mock path: simulate latency with asyncio.sleep
+            # Simulate latency with asyncio.sleep
             if prefill_seqs:
                 total_prompt = sum(len(r.prompt_tokens) for r in prefill_seqs)
                 await asyncio.sleep(_PREFILL_COST_PER_TOKEN_S * total_prompt)

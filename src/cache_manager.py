@@ -307,7 +307,7 @@ class HierarchicalCacheManager:
     ) -> None:
         self._gpu = BlockAllocator(num_gpu_blocks)
         self._cpu = BlockAllocator(num_cpu_blocks)
-        # Default: INT8-quantized Tier 3 for 2× NVMe compression (TTKV 2024)
+        # Default: INT8-quantized Tier 3 for 2× NVMe compression
         if quantize_storage and num_storage_blocks > 0:
             self._storage = QuantizingStorageBlockAllocator(num_storage_blocks)
         else:
@@ -461,10 +461,6 @@ class HierarchicalCacheManager:
         self._cpu_table[request.request_id] = cpu_blocks
         return True
 
-    # ------------------------------------------------------------------
-    # Full reclaim across all tiers (called on request finish / abort)
-    # ------------------------------------------------------------------
-
     def free_all(self, request_id: str) -> None:
         self.free(request_id)
         for b in self._cpu_table.pop(request_id, []):
@@ -472,19 +468,11 @@ class HierarchicalCacheManager:
         for sid in self._storage_table.pop(request_id, []):
             self._storage.free(sid)
 
-    # ------------------------------------------------------------------
-    # Convenience helpers for backward compat with existing 2-tier code
-    # ------------------------------------------------------------------
-
     def swap_out(self, request: SequenceRequest) -> bool:
         return self.swap_gpu_to_cpu(request)
 
     def swap_in(self, request: SequenceRequest) -> bool:
         return self.swap_cpu_to_gpu(request)
-
-    # ------------------------------------------------------------------
-    # Inspection helpers
-    # ------------------------------------------------------------------
 
     def block_table_for(self, request_id: str) -> List[int]:
         return [b.block_id for b in self._gpu_table.get(request_id, [])]
@@ -512,7 +500,7 @@ class HierarchicalCacheManager:
             "num_gpu_sequences": len(self._gpu_table),
             "num_cpu_sequences": len(self._cpu_table),
             "num_storage_sequences": len(self._storage_table),
-            # Quantization Cascading stats (TTKV 2024)
+            # Quantization Cascading stats
             "storage_quantized": isinstance(self._storage, QuantizingStorageBlockAllocator),
             "storage_compression_ratio": self._storage.compression_ratio,
             "storage_bytes_saved": self._storage.bytes_saved,
